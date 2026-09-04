@@ -127,7 +127,7 @@ jobs:
 
       - name: Upload intermediate etcd result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: raw-${{ github.run_id }}-etcd-${{ matrix.mode }}
           path: results
@@ -208,9 +208,9 @@ jobs:
 
           start_ns=$(date +%s%N)
           set +e
-          { cd "$LLGO_ROOT" && /usr/bin/time -v -o "$GITHUB_WORKSPACE/results/resource.txt" \
+          ( cd "$LLGO_ROOT" && /usr/bin/time -v -o "$GITHUB_WORKSPACE/results/resource.txt" \
               "$GITHUB_WORKSPACE/.tools/llgo" "${args[@]}"; \
-          } > >(tee results/stdout.log) 2> >(tee results/stderr.log >&2)
+          ) > >(tee results/stdout.log) 2> >(tee results/stderr.log >&2)
           test_status=$?
           set -e
           end_ns=$(date +%s%N)
@@ -234,7 +234,7 @@ jobs:
 
       - name: Upload intermediate test result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: raw-${{ github.run_id }}-llgo-test-${{ matrix.variant }}
           path: results
@@ -250,7 +250,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Download all intermediate results
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: raw-${{ github.run_id }}-*
           path: downloaded
@@ -265,7 +265,7 @@ jobs:
 
       - name: Upload combined profile package
         id: upload_bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-parallel-profile-${{ github.run_id }}
           path: bundle
