@@ -47,20 +47,20 @@ def occupancy(worker_spans, start, end):
 
 def color_for(stage):
     colors = {
-        "backend+publish": "#2563eb",
+        "backend+publish": "#246bce",
         "build": "#111827",
-        "entry": "#0f766e",
-        "entry-object": "#0f766e",
-        "link": "#16a34a",
-        "link-snapshot": "#0891b2",
-        "load": "#db2777",
-        "plan": "#9333ea",
-        "pre": "#dc2626",
-        "precompute": "#64748b",
-        "prepare": "#4f46e5",
-        "repair": "#ca8a04",
-        "ssa": "#ea580c",
-        "test": "#be123c",
+        "entry": "#008b8b",
+        "entry-object": "#008b8b",
+        "link": "#008a3b",
+        "link-snapshot": "#00a6d6",
+        "load": "#c62b83",
+        "plan": "#7d3ac1",
+        "pre": "#d62828",
+        "precompute": "#667085",
+        "prepare": "#5d9800",
+        "repair": "#9a8500",
+        "ssa": "#e66a00",
+        "test": "#6d214f",
     }
     if stage in colors:
         return colors[stage]
