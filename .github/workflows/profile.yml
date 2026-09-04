@@ -144,7 +144,7 @@ jobs:
         include:
           - variant: main
             repository: xgo-dev/llgo
-            trace: "true"
+            trace: "false"
           - variant: optimized
             repository: cpunion/llgo
             trace: "true"
