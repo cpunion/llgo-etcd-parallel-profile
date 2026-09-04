@@ -46,10 +46,25 @@ def occupancy(worker_spans, start, end):
 
 
 def color_for(stage):
-    palette = [
-        "#2563eb", "#16a34a", "#dc2626", "#9333ea", "#ea580c",
-        "#0891b2", "#4f46e5", "#ca8a04", "#db2777", "#0f766e",
-    ]
+    colors = {
+        "backend+publish": "#2563eb",
+        "build": "#111827",
+        "entry": "#0f766e",
+        "entry-object": "#0f766e",
+        "link": "#16a34a",
+        "link-snapshot": "#0891b2",
+        "load": "#db2777",
+        "plan": "#9333ea",
+        "pre": "#dc2626",
+        "precompute": "#64748b",
+        "prepare": "#4f46e5",
+        "repair": "#ca8a04",
+        "ssa": "#ea580c",
+        "test": "#be123c",
+    }
+    if stage in colors:
+        return colors[stage]
+    palette = ["#0369a1", "#7c2d12", "#65a30d", "#6d28d9", "#047857"]
     digest = hashlib.sha256(stage.encode()).digest()
     return palette[int.from_bytes(digest[:2], "big") % len(palette)]
 
@@ -64,6 +79,12 @@ def render_html(metrics, spans, path):
     plot_width = width - left - 20
     height = 58 + row_height * len(lanes)
     lane_index = {lane: index for index, lane in enumerate(lanes)}
+    stages = sorted({stage_of(event) for event in spans})
+    legend = "".join(
+        f'<span class="legend-item"><span class="swatch" '
+        f'style="background:{color_for(stage)}"></span>{html.escape(stage)}</span>'
+        for stage in stages
+    )
 
     svg = []
     for tick in range(11):
@@ -133,6 +154,9 @@ h1, h2 {{ margin: 0.7em 0 0.35em; }}
 .card {{ border: 1px solid #d1d5db; border-radius: 8px; padding: 12px; background: #f9fafb; }}
 .value {{ font-size: 24px; font-weight: 650; }}
 .timeline {{ overflow-x: auto; border: 1px solid #d1d5db; border-radius: 8px; background: white; }}
+.legend {{ display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 8px 0 12px; }}
+.legend-item {{ display: inline-flex; align-items: center; gap: 5px; }}
+.swatch {{ width: 12px; height: 12px; border-radius: 2px; }}
 svg {{ min-width: 1100px; width: 100%; height: auto; display: block; }}
 table {{ border-collapse: collapse; width: 100%; }}
 th, td {{ border-bottom: 1px solid #e5e7eb; padding: 7px 9px; text-align: left; }}
@@ -156,6 +180,8 @@ trace capacity: {metrics['trace_capacity']} worker lane(s). The raw
   <div class="card"><div>Time with 2+ workers</div><div class="value">{metrics['parallel_time_percent']:.1f}%</div></div>
 </div>
 <h2>Timeline</h2>
+<p class="note">Colors identify trace stages only; they do not encode status or utilization. Hover over a span for its name and duration.</p>
+<div class="legend">{legend}</div>
 <div class="timeline"><svg viewBox="0 0 {width} {height}" role="img">
 {''.join(svg)}
 </svg></div>
