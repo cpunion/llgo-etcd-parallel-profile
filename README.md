@@ -1,48 +1,66 @@
-# LLGo etcd parallel build profile
+# LLGo parallel build profiles
 
-This repository measures package-build parallelism in
-[LLGo PR #2482](https://github.com/xgo-dev/llgo/pull/2482) with the `etcdctl`
-case from [xgo-dev/benchmarks](https://github.com/xgo-dev/benchmarks).
+This repository measures the combined optimization branch
+`cpunion/llgo:codex/parallel-profile-combined`. That branch contains:
 
-The workflow builds the exact same `go.etcd.io/etcd/etcdctl/v3@v3.6.14`
-target twice on separate clean GitHub-hosted runners:
+- the package/link/run DAG work from
+  [LLGo PR #2482](https://github.com/xgo-dev/llgo/pull/2482), including
+  cost-ordered SSA and backend queues; and
+- the standalone large aggregate equality lowering fix used to prevent LLVM
+  from spending most of a build optimizing comparisons such as
+  `crypto/mldsa.PrivateKey == PrivateKey{}`.
 
-- `serial`: `llgo build -p 1`
-- `parallel`: `llgo build` (LLGo's Go-compatible default, `GOMAXPROCS`)
+The workflow runs two workloads on clean GitHub-hosted Linux runners:
 
-Both runs use fresh LLGo and Go build caches. Module downloads and building the
-LLGo command itself happen outside the measured interval. The artifacts contain:
+1. The `go.etcd.io/etcd/etcdctl/v3@v3.6.14` target from
+   [xgo-dev/benchmarks](https://github.com/xgo-dev/benchmarks), once with
+   `llgo build -p 1` and once with LLGo's default `GOMAXPROCS` parallelism.
+2. The LLGo multi-package workload `llgo test -count=1 ./test/...`, on both
+   current `xgo-dev/llgo:main` and the combined profile branch.
 
-- the linked `etcdctl` executable;
-- the raw Chrome/Perfetto `trace.json` emitted by `-debug-trace`;
-- stdout, stderr, and GNU `time -v` resource data;
-- `metrics.json`, a Markdown summary, and a self-contained HTML timeline;
-- a combined serial-versus-parallel HTML and JSON comparison.
+Module downloads, dependency setup, and building the `llgo` command happen
+outside the measured intervals. Fresh Go and LLGo build caches are used for
+each measured run.
 
-Download an artifact from the latest
-[Profile LLGo etcdctl build](https://github.com/cpunion/llgo-etcd-parallel-profile/actions/workflows/profile.yml)
-run. Open
-`report.html` directly for a compact timeline, or load `trace.json` into
-[Perfetto](https://ui.perfetto.dev/) for full trace inspection.
+## Download and inspect
 
-## What this measures
+Each workflow run publishes one `llgo-parallel-profile-<run-id>` artifact.
+Its top-level `index.html` links every workload result and comparison. The
+bundle includes:
 
-`etcdctl` is one main package with a large dependency closure. It measures
-LLGo's flat package worker pool (`ssa` and `backend+publish`, where publication
-includes `.o` to `.a`, cache publication, and ownership cleanup). It does not
-exercise PR #2482's multi-root native-test chain:
+- linked executables where a workload produces one;
+- raw Chrome/Perfetto `trace.json` files;
+- self-contained HTML timelines with an explicit color legend;
+- the slowest SSA packages with their AST-node scheduling estimate;
+- the slowest backend/package-publication tasks with their real Go SSA
+  instruction count;
+- stdout, stderr, exit status, exact LLGo commit, wall time, and GNU
+  `time -v` resource measurements.
+
+Open the latest
+[Profile LLGo parallel builds](https://github.com/cpunion/llgo-etcd-parallel-profile/actions/workflows/profile.yml)
+run, download its single artifact, and open `index.html`. A raw `trace.json`
+can also be loaded into [Perfetto](https://ui.perfetto.dev/).
+
+## What the trace shows
+
+The package pool uses independent ready tasks rather than import-DAG edges.
+The SSA phase uses an already-parsed AST-node count as a cheap pre-build
+ordering estimate. Once SSA exists, backend tasks are ordered by the actual
+number of Go SSA instructions. On host builds, ordinary and runtime packages
+share that same pool. Package archives then feed the downstream link/run DAG:
 
 ```text
-package output -> plan link -> entry object -> link/finalize -> run
+package backend + .o/.a publication -> plan link -> entry object -> link/finalize -> run
 ```
 
-The package tasks in that chain have no package-to-package DAG edges; they are
-independent ready tasks sharing the same `-p` worker budget. Only their produced
-outputs feed the downstream link/run DAG.
+The AST count is one linear walk over syntax already resident in memory; it
+does not parse or type-check again. The trace exposes `rank SSA packages` and
+`count SSA instructions` coordinator spans so their overhead remains visible.
 
-## Reproduce locally
+## Reproduce the etcd comparison locally
 
-With the PR's `llgo` on `PATH` and `LLGO_ROOT` set:
+With the combined branch's `llgo` on `PATH` and `LLGO_ROOT` set:
 
 ```sh
 go mod download all

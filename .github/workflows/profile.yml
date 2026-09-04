@@ -1,4 +1,4 @@
-name: Profile LLGo etcdctl build
+name: Profile LLGo parallel builds
 
 on:
   push:
@@ -8,22 +8,23 @@ on:
       llgo_ref:
         description: Branch, tag, or commit in cpunion/llgo
         required: true
-        default: codex/parallel-test-links
+        default: codex/parallel-profile-combined
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
-  group: llgo-etcd-profile-${{ github.ref }}
+  group: llgo-parallel-profile-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  LLGO_REF: ${{ inputs.llgo_ref || 'codex/parallel-test-links' }}
+  LLGO_REF: ${{ inputs.llgo_ref || 'codex/parallel-profile-combined' }}
   TARGET_PACKAGE: go.etcd.io/etcd/etcdctl/v3
 
 jobs:
-  build:
-    name: ${{ matrix.mode }} build
+  etcd:
+    name: etcd ${{ matrix.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -75,7 +76,6 @@ jobs:
           llvm-config --version | tee results/llvm-version.txt
 
       - name: Build and trace etcdctl
-        id: measured
         shell: bash
         env:
           MODE: ${{ matrix.mode }}
@@ -107,14 +107,14 @@ jobs:
           build_status=$?
           set -e
           end_ns=$(date +%s%N)
-          wall_ns=$((end_ns - start_ns))
-          wall_seconds=$(awk -v ns="$wall_ns" 'BEGIN { printf "%.6f", ns / 1000000000 }')
+          wall_seconds=$(awk -v ns="$((end_ns - start_ns))" 'BEGIN { printf "%.6f", ns / 1000000000 }')
           printf '%s\n' "$wall_seconds" > results/wall-seconds.txt
           printf '%s\n' "$build_status" > results/exit-status.txt
 
           if [[ -s results/trace.json ]]; then
             python3 scripts/analyze_trace.py \
               --trace results/trace.json \
+              --title "etcdctl $MODE build" \
               --mode "$MODE" \
               --requested-parallelism "$PARALLELISM" \
               --wall-seconds "$wall_seconds" \
@@ -125,40 +125,166 @@ jobs:
           fi
           exit "$build_status"
 
-      - name: Upload ${{ matrix.mode }} output and profile
+      - name: Upload intermediate etcd result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: etcd-profile-${{ matrix.mode }}
+          name: raw-${{ github.run_id }}-etcd-${{ matrix.mode }}
           path: results
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
-  compare:
-    name: Compare serial and parallel
-    needs: build
+  llgo-test:
+    name: llgo test ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: main
+            repository: xgo-dev/llgo
+            trace: "true"
+          - variant: optimized
+            repository: cpunion/llgo
+            trace: "true"
+    steps:
+      - name: Check out profile repository
+        uses: actions/checkout@v7
+
+      - name: Check out LLGo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.variant == 'optimized' && env.LLGO_REF || 'main' }}
+          path: .llgo
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .llgo/.go-version
+          cache: false
+
+      - name: Install LLGo dependencies
+        uses: ./.llgo/.github/actions/setup-deps
+        with:
+          llvm-version: 19
+
+      - name: Build LLGo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tools results
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export LLGO_ROOT="$GITHUB_WORKSPACE/.llgo"
+          (
+            cd "$LLGO_ROOT"
+            go build -tags=dev -o "$GITHUB_WORKSPACE/.tools/llgo" ./cmd/llgo
+          )
+          git -C "$LLGO_ROOT" rev-parse HEAD | tee results/llgo-commit.txt
+          go version | tee results/go-version.txt
+          llvm-config --version | tee results/llvm-version.txt
+
+      - name: Run LLGo test workload
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          TRACE: ${{ matrix.trace }}
+        run: |
+          set -uo pipefail
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export LLGO_ROOT="$GITHUB_WORKSPACE/.llgo"
+          export GOCACHE="$RUNNER_TEMP/gocache-$VARIANT"
+          export LLGO_CACHE_DIR="$RUNNER_TEMP/llgo-cache-$VARIANT"
+          mkdir -p "$GOCACHE" "$LLGO_CACHE_DIR" results
+
+          args=(test -count=1 ./test/...)
+          if [[ "$TRACE" == true ]]; then
+            args=(test -count=1 -debug-trace="$GITHUB_WORKSPACE/results/trace.json" ./test/...)
+          fi
+          printf '%q ' "$GITHUB_WORKSPACE/.tools/llgo" "${args[@]}" | tee results/command.txt
+          echo | tee -a results/command.txt
+
+          start_ns=$(date +%s%N)
+          set +e
+          { cd "$LLGO_ROOT" && /usr/bin/time -v -o "$GITHUB_WORKSPACE/results/resource.txt" \
+              "$GITHUB_WORKSPACE/.tools/llgo" "${args[@]}"; \
+          } > >(tee results/stdout.log) 2> >(tee results/stderr.log >&2)
+          test_status=$?
+          set -e
+          end_ns=$(date +%s%N)
+          wall_seconds=$(awk -v ns="$((end_ns - start_ns))" 'BEGIN { printf "%.6f", ns / 1000000000 }')
+          printf '%s\n' "$wall_seconds" > results/wall-seconds.txt
+          printf '%s\n' "$test_status" > results/exit-status.txt
+
+          if [[ -s results/trace.json ]]; then
+            python3 scripts/analyze_trace.py \
+              --trace results/trace.json \
+              --title "llgo test ./test/... ($VARIANT)" \
+              --mode "$VARIANT" \
+              --requested-parallelism default \
+              --wall-seconds "$wall_seconds" \
+              --output results/metrics.json \
+              --markdown results/summary.md \
+              --html results/report.html
+            cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$test_status"
+
+      - name: Upload intermediate test result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_id }}-llgo-test-${{ matrix.variant }}
+          path: results
+          if-no-files-found: error
+          retention-days: 1
+
+  report:
+    name: Aggregate profiles
+    needs: [etcd, llgo-test]
     if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download profiles
+      - name: Download all intermediate results
         uses: actions/download-artifact@v5
         with:
-          pattern: etcd-profile-*
+          pattern: raw-${{ github.run_id }}-*
           path: downloaded
 
-      - name: Generate comparison
+      - name: Build one self-contained report bundle
         run: |
-          python3 scripts/compare_profiles.py \
+          python3 scripts/assemble_bundle.py \
             --root downloaded \
-            --output comparison
-          cat comparison/summary.md >> "$GITHUB_STEP_SUMMARY"
+            --output bundle \
+            --run-id "${{ github.run_id }}"
+          cat bundle/summary.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload comparison
+      - name: Upload combined profile package
+        id: upload_bundle
         uses: actions/upload-artifact@v4
         with:
-          name: etcd-profile-comparison
-          path: comparison
+          name: llgo-parallel-profile-${{ github.run_id }}
+          path: bundle
           if-no-files-found: error
           retention-days: 30
+
+      - name: Delete intermediate artifacts
+        if: ${{ steps.upload_bundle.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("raw-'"$GITHUB_RUN_ID"'-")) | .id' |
+          while read -r artifact_id; do
+            [[ -z "$artifact_id" ]] || gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+          done
+
+      - name: Preserve workload failures after uploading diagnostics
+        if: ${{ needs.etcd.result != 'success' || needs.llgo-test.result != 'success' }}
+        run: exit 1

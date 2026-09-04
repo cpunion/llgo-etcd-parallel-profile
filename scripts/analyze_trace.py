@@ -69,6 +69,23 @@ def color_for(stage):
     return palette[int.from_bytes(digest[:2], "big") % len(palette)]
 
 
+def package_stage_metrics(spans, stage, score_name):
+    result = []
+    for event in spans:
+        if stage_of(event) != stage:
+            continue
+        args = event.get("args") or {}
+        result.append(
+            {
+                "package": str(args.get("package") or event.get("name", "")),
+                "seconds": rounded(event.get("dur", 0) / 1_000_000),
+                "score": args.get(score_name),
+                "lane": int(event.get("tid", 0)),
+            }
+        )
+    return sorted(result, key=lambda item: -item["seconds"])[:20]
+
+
 def render_html(metrics, spans, path):
     start = metrics["trace_start_us"]
     duration = max(1, metrics["trace_duration_us"])
@@ -141,12 +158,23 @@ def render_html(metrics, spans, path):
         "</tr>"
         for item in metrics["longest_spans"]
     )
+    package_table = lambda items: "".join(
+        "<tr>"
+        f"<td>{html.escape(item['package'])}</td>"
+        f"<td>{item['lane']}</td>"
+        f"<td>{item['seconds']:.3f}</td>"
+        f"<td>{'—' if item['score'] is None else item['score']}</td>"
+        "</tr>"
+        for item in items
+    )
+    ssa_rows = package_table(metrics["slow_ssa_packages"])
+    backend_rows = package_table(metrics["slow_backend_packages"])
     document = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LLGo etcdctl {html.escape(metrics['mode'])} build profile</title>
+<title>{html.escape(metrics['title'])} profile</title>
 <style>
 body {{ font: 14px/1.45 system-ui, sans-serif; margin: 24px; color: #111827; }}
 h1, h2 {{ margin: 0.7em 0 0.35em; }}
@@ -166,7 +194,7 @@ code {{ background: #f3f4f6; padding: 2px 4px; border-radius: 4px; }}
 </style>
 </head>
 <body>
-<h1>LLGo etcdctl {html.escape(metrics['mode'])} build</h1>
+<h1>{html.escape(metrics['title'])}</h1>
 <p class="note">Requested parallelism: <code>{html.escape(metrics['requested_parallelism'])}</code>;
 trace capacity: {metrics['trace_capacity']} worker lane(s). The raw
 <a href="trace.json">trace.json</a> can be loaded into
@@ -191,6 +219,14 @@ trace capacity: {metrics['trace_capacity']} worker lane(s). The raw
 <h2>Longest spans</h2>
 <table><thead><tr><th>Span</th><th>Lane</th><th>Duration</th></tr></thead>
 <tbody>{top_rows}</tbody></table>
+<h2>Slow SSA packages</h2>
+<p class="note">AST nodes are a cheap pre-build scheduling estimate. Missing values indicate a trace produced before that metric was added.</p>
+<table><thead><tr><th>Package</th><th>Lane</th><th>Duration</th><th>AST nodes</th></tr></thead>
+<tbody>{ssa_rows}</tbody></table>
+<h2>Slow backend + publish packages</h2>
+<p class="note">Backends are queued by actual Go SSA instruction count. Duration also includes object/archive publication.</p>
+<table><thead><tr><th>Package</th><th>Lane</th><th>Duration</th><th>SSA instructions</th></tr></thead>
+<tbody>{backend_rows}</tbody></table>
 </body>
 </html>
 """
@@ -200,6 +236,7 @@ trace capacity: {metrics['trace_capacity']} worker lane(s). The raw
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True, type=Path)
+    parser.add_argument("--title")
     parser.add_argument("--mode", required=True)
     parser.add_argument("--requested-parallelism", required=True)
     parser.add_argument("--wall-seconds", required=True, type=float)
@@ -255,6 +292,7 @@ def main():
     longest = sorted(spans, key=lambda event: event.get("dur", 0), reverse=True)[:20]
 
     metrics = {
+        "title": args.title or f"LLGo etcdctl {args.mode} build",
         "mode": args.mode,
         "requested_parallelism": args.requested_parallelism,
         "wall_seconds": rounded(args.wall_seconds, 6),
@@ -279,13 +317,17 @@ def main():
             }
             for event in longest
         ],
+        "slow_ssa_packages": package_stage_metrics(spans, "ssa", "syntax_nodes"),
+        "slow_backend_packages": package_stage_metrics(
+            spans, "backend+publish", "ssa_instructions"
+        ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     args.markdown.write_text(
         "\n".join(
             [
-                f"### {args.mode.capitalize()} etcdctl build",
+                f"### {metrics['title']}",
                 "",
                 "| Metric | Value |",
                 "|---|---:|",
@@ -297,6 +339,26 @@ def main():
                 f"| Worker utilization | {metrics['worker_utilization_percent']:.1f}% |",
                 f"| Trace time with 2+ workers | {metrics['parallel_time_percent']:.1f}% |",
                 f"| Worker spans | {len(worker_spans)} |",
+                "",
+                "#### Slowest SSA packages",
+                "",
+                "| Package | Duration | AST nodes |",
+                "|---|---:|---:|",
+                *[
+                    f"| `{item['package']}` | {item['seconds']:.3f} s | "
+                    f"{item['score'] if item['score'] is not None else '—'} |"
+                    for item in metrics["slow_ssa_packages"][:10]
+                ],
+                "",
+                "#### Slowest backend + publish packages",
+                "",
+                "| Package | Duration | SSA instructions |",
+                "|---|---:|---:|",
+                *[
+                    f"| `{item['package']}` | {item['seconds']:.3f} s | "
+                    f"{item['score'] if item['score'] is not None else '—'} |"
+                    for item in metrics["slow_backend_packages"][:10]
+                ],
                 "",
             ]
         ),
