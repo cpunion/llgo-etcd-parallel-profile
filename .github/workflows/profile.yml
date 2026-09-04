@@ -1,0 +1,164 @@
+name: Profile LLGo etcdctl build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      llgo_ref:
+        description: Branch, tag, or commit in cpunion/llgo
+        required: true
+        default: codex/parallel-test-links
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llgo-etcd-profile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLGO_REF: ${{ inputs.llgo_ref || 'codex/parallel-test-links' }}
+  TARGET_PACKAGE: go.etcd.io/etcd/etcdctl/v3
+
+jobs:
+  build:
+    name: ${{ matrix.mode }} build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: serial
+            parallelism: "1"
+          - mode: parallel
+            parallelism: "default"
+    steps:
+      - name: Check out profile repository
+        uses: actions/checkout@v7
+
+      - name: Check out LLGo PR branch
+        uses: actions/checkout@v7
+        with:
+          repository: cpunion/llgo
+          ref: ${{ env.LLGO_REF }}
+          path: .llgo
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .llgo/.go-version
+          cache: false
+
+      - name: Install LLGo dependencies
+        uses: ./.llgo/.github/actions/setup-deps
+        with:
+          llvm-version: 19
+
+      - name: Build LLGo and download etcd modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tools results
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export LLGO_ROOT="$GITHUB_WORKSPACE/.llgo"
+          export GOMODCACHE="$RUNNER_TEMP/gomodcache"
+          (
+            cd "$LLGO_ROOT"
+            go build -tags=dev -o "$GITHUB_WORKSPACE/.tools/llgo" ./cmd/llgo
+          )
+          go mod download all
+          git -C "$LLGO_ROOT" rev-parse HEAD | tee results/llgo-commit.txt
+          go version | tee results/go-version.txt
+          llvm-config --version | tee results/llvm-version.txt
+
+      - name: Build and trace etcdctl
+        id: measured
+        shell: bash
+        env:
+          MODE: ${{ matrix.mode }}
+          PARALLELISM: ${{ matrix.parallelism }}
+        run: |
+          set -uo pipefail
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export LLGO_ROOT="$GITHUB_WORKSPACE/.llgo"
+          export GOMODCACHE="$RUNNER_TEMP/gomodcache"
+          export GOCACHE="$RUNNER_TEMP/gocache-$MODE"
+          export LLGO_CACHE_DIR="$RUNNER_TEMP/llgo-cache-$MODE"
+          mkdir -p "$GOCACHE" "$LLGO_CACHE_DIR" results
+
+          args=(build -debug-trace="$GITHUB_WORKSPACE/results/trace.json"
+            -o "$GITHUB_WORKSPACE/results/etcdctl" "$TARGET_PACKAGE")
+          if [[ "$PARALLELISM" != default ]]; then
+            args=(build -p "$PARALLELISM"
+              -debug-trace="$GITHUB_WORKSPACE/results/trace.json"
+              -o "$GITHUB_WORKSPACE/results/etcdctl" "$TARGET_PACKAGE")
+          fi
+          printf '%q ' "$GITHUB_WORKSPACE/.tools/llgo" "${args[@]}" | tee results/command.txt
+          echo | tee -a results/command.txt
+
+          start_ns=$(date +%s%N)
+          set +e
+          { /usr/bin/time -v -o results/resource.txt \
+              "$GITHUB_WORKSPACE/.tools/llgo" "${args[@]}"; \
+          } > >(tee results/stdout.log) 2> >(tee results/stderr.log >&2)
+          build_status=$?
+          set -e
+          end_ns=$(date +%s%N)
+          wall_ns=$((end_ns - start_ns))
+          wall_seconds=$(awk -v ns="$wall_ns" 'BEGIN { printf "%.6f", ns / 1000000000 }')
+          printf '%s\n' "$wall_seconds" > results/wall-seconds.txt
+          printf '%s\n' "$build_status" > results/exit-status.txt
+
+          if [[ -s results/trace.json ]]; then
+            python3 scripts/analyze_trace.py \
+              --trace results/trace.json \
+              --mode "$MODE" \
+              --requested-parallelism "$PARALLELISM" \
+              --wall-seconds "$wall_seconds" \
+              --output results/metrics.json \
+              --markdown results/summary.md \
+              --html results/report.html
+            cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$build_status"
+
+      - name: Upload ${{ matrix.mode }} output and profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etcd-profile-${{ matrix.mode }}
+          path: results
+          if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    name: Compare serial and parallel
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download profiles
+        uses: actions/download-artifact@v5
+        with:
+          pattern: etcd-profile-*
+          path: downloaded
+
+      - name: Generate comparison
+        run: |
+          python3 scripts/compare_profiles.py \
+            --root downloaded \
+            --output comparison
+          cat comparison/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: etcd-profile-comparison
+          path: comparison
+          if-no-files-found: error
+          retention-days: 30
